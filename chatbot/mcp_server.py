@@ -49,16 +49,25 @@ def _get_samples():
     return _samples_cache
 
 
-def _nl_to_sql(question: str) -> str:
-    """Doğal dil sorusunu SQL'e çevirir."""
+def _nl_to_sql(question: str, context: str = "") -> str:
+    """Doğal dil sorusunu SQL'e çevirir. Konuşma bağlamını da dikkate alır."""
     model = genai.GenerativeModel("gemini-2.0-flash")
+
+    context_block = ""
+    if context:
+        context_block = f"""\n\nÖnceki konuşma bağlamı:
+---
+{context}
+---
+Kullanıcı önceki konuşmaya atıf yapıyor olabilir. Örneğin "bunların fiyatı" diyorsa,
+önceki sorgudaki marka/model/filtre bilgilerini yeni sorguya dahil et."""
 
     prompt = f"""Sen bir SQL uzmanısın. Aşağıdaki VIEW şemasına göre soruyu SQL sorgusuna çevir.
 
 {_get_schema()}
 
 Mevcut Değerler:
-{_get_samples()}
+{_get_samples()}{context_block}
 
 ÖNEMLİ KURALLAR:
 1. SADECE SELECT sorgusu üret
@@ -66,6 +75,7 @@ Mevcut Değerler:
 3. LIMIT 20 varsayılan
 4. Türkçe karakter duyarlılığına dikkat et
 5. Eğer boya detayı gerekiyorsa: JOIN boya_detaylari bd ON bd.ilan_db_id = v_ilanlar.id
+6. Eğer kullanıcı önceki sorgulara atıfta bulunuyorsa, önceki bağlamdaki kriterleri de sorguna dahil et.
 
 Örnek sorgular:
 - "En ucuz 5 BMW": SELECT baslik, marka, seri, fiyat, yil FROM v_ilanlar WHERE marka = 'BMW' ORDER BY fiyat ASC LIMIT 5
@@ -106,10 +116,11 @@ def _embed_query(text: str) -> list[float]:
 def handle_sql_query(args: dict) -> dict:
     """Doğal dil sorusunu SQL'e çevirip çalıştırır."""
     question = args.get("question", "")
+    context = args.get("context", "")
     log.info(f"sql_query: {question}")
 
     try:
-        sql = _nl_to_sql(question)
+        sql = _nl_to_sql(question, context)
         log.info(f"SQL: {sql[:200]}")
         columns, rows = execute_query(sql)
 

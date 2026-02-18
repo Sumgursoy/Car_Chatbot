@@ -26,7 +26,7 @@ MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
 # ─────────────── PAGE CONFIG ───────────────
 
 st.set_page_config(
-    page_title="🚗 Arabam Chatbot",
+    page_title=" Arabam Chatbot",
     page_icon="🚗",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -333,6 +333,23 @@ st.markdown("""
 # ─────────────── MCP CLIENT ───────────────
 
 
+def _build_context(max_turns: int = 5) -> str:
+    """Son N tur mesajdan konuşma bağlamı oluşturur."""
+    messages = st.session_state.get("messages", [])
+    if not messages:
+        return ""
+
+    recent = messages[-(max_turns * 2):]  # user+assistant çiftleri
+    lines = []
+    for msg in recent:
+        role = "Kullanıcı" if msg["role"] == "user" else "Asistan"
+        # Çok uzun cevapları kısalt
+        content = msg["content"][:300] if msg["role"] == "assistant" else msg["content"]
+        lines.append(f"{role}: {content}")
+
+    return "\n".join(lines)
+
+
 def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
     """MCP Server'daki bir tool'u çağırır."""
     log.info(f"MCP tool çağrısı: {tool_name}({arguments})")
@@ -357,8 +374,17 @@ def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
 def decide_tool(question: str) -> tuple[str, dict]:
     """Kullanıcı sorusuna göre hangi MCP tool'un çağrılacağına karar verir."""
     model = genai.GenerativeModel("gemini-2.0-flash")
+    context = _build_context()
 
-    prompt = f"""Kullanıcı şu soruyu sordu: "{question}"
+    context_block = ""
+    if context:
+        context_block = f"""\n\nÖnceki konuşma bağlamı:
+---
+{context}
+---
+Yukarıdaki bağlamı dikkate al. Kullanıcı önceki konuşmaya atıf yapıyor olabilir."""
+
+    prompt = f"""Kullanıcı şu soruyu sordu: "{question}"{context_block}
 
 Bu soruyu yanıtlamak için aşağıdaki araçlardan hangisi kullanılmalı?
 
@@ -382,8 +408,9 @@ Başka bir şey yazma."""
     response = model.generate_content(prompt)
     tool = response.text.strip().lower().replace("`", "")
 
+    # Konuşma bağlamını sql_query'ye ekle
     if tool == "sql_query":
-        return "sql_query", {"question": question}
+        return "sql_query", {"question": question, "context": context}
     elif tool == "search_similar_cars":
         return "search_similar_cars", {"query": question, "limit": 10}
     elif tool == "get_car_details":
