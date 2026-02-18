@@ -21,6 +21,7 @@ services:
       - MYSQL_HOST=host.docker.internal
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      - MCP_PORT=8000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

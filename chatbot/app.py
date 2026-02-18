@@ -1,27 +1,56 @@
 """
-Arabam Chatbot — Streamlit Arayüzü (MCP Client)
-==================================================
-MCP Server üzerinden araç ilanı veritabanını sorgula.
+Arabam Chatbot — Streamlit Arayüzü (MCP Client + Gemini Function Calling)
+===========================================================================
+FastMCP Server'a MCP protokolü ile bağlanır.
+Gemini, tool'ları otomatik çağırarak kullanıcı sorularını yanıtlar.
 """
 
 import os
 import json
+import asyncio
 import streamlit as st
-import pandas as pd
-import httpx
-import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
+
+from google import genai
+from google.genai import types
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 
 from logger import get_logger
 
 log = get_logger("app")
 
-# Gemini
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# GenAI Client
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
+MCP_SSE_URL = f"{MCP_SERVER_URL}/sse"
+
+MODEL_NAME = "gemini-2.5-flash"
+
+SYSTEM_PROMPT = """Sen "Arabam Chatbot" adlı bir araç ilanı asistanısın. Türkçe konuş.
+Bir oto galeri danışmanı gibi davran — samimi, bilgili ve yardımsever ol.
+
+## Görevin
+Kullanıcıların araç ilanları hakkındaki sorularını yanıtlamak için sana verilen MCP araçlarını kullan.
+Her soruya uygun aracı seçip çağır, sonuçları doğal ve anlaşılır Türkçe ile sun.
+
+## KRİTİK Kurallar
+1. **HER ZAMAN önce araçları kullan!** Bir soruyu "yapamıyorum/bulunamaz" diye cevaplama — önce uygun aracı çağırıp dene.
+2. **Asla bilgi uydurma!** Sadece araçlardan dönen verileri kullanarak cevap ver. Önceki konuşmadan bilgi üretme.
+3. Bir fiyat veya numara sorulduğunda, araba_ara tool'unu filtrelerle kullanarak o aracı bulmaya çalış.
+4. Sayısal değerleri okunabilir yaz: 845.000 TL, 120.000 km
+5. Sonuçları liste veya tablo formatında sun
+6. Kısa ve öz ol ama bilgilendirici
+7. Veriden ilginç çıkarımlar yap (örn: "Bu fiyata göre oldukça düşük kilometreli!")
+8. Emoji kullan ama abartma
+9. Kullanıcı önceki konuşmaya atıf yaparsa (örn: "bunların fiyatı?"), chat geçmişinden bağlamı anla
+10. Sana verilen araçlarla ilgisi olmayan sorularda kibarca araçlarla ilgili yardım edebileceğini belirt
+11. Bir soruyu yanıtlamak için birden fazla araç çağırabilirsin — mesela fiyat istatistiğini aldıktan sonra detaylı listeyi araba_ara ile çekebilirsin
+"""
 
 # ─────────────── PAGE CONFIG ───────────────
 
@@ -159,57 +188,6 @@ st.markdown("""
         backdrop-filter: blur(10px);
     }
 
-    /* ── Arama modu etiketi ── */
-    .search-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.4rem;
-        padding: 0.25rem 0.75rem;
-        border-radius: 20px;
-        font-size: 0.72rem;
-        font-weight: 600;
-        letter-spacing: 0.5px;
-        margin-bottom: 0.8rem;
-    }
-    .badge-sql {
-        background: linear-gradient(135deg, rgba(59,130,246,0.15), rgba(99,102,241,0.15));
-        border: 1px solid rgba(59,130,246,0.25);
-        color: #93c5fd;
-    }
-    .badge-semantic {
-        background: linear-gradient(135deg, rgba(168,85,247,0.15), rgba(236,72,153,0.15));
-        border: 1px solid rgba(168,85,247,0.25);
-        color: #c4b5fd;
-    }
-    .badge-detail {
-        background: linear-gradient(135deg, rgba(52,211,153,0.15), rgba(16,185,129,0.15));
-        border: 1px solid rgba(52,211,153,0.25);
-        color: #6ee7b7;
-    }
-    .badge-stats {
-        background: linear-gradient(135deg, rgba(251,191,36,0.15), rgba(245,158,11,0.15));
-        border: 1px solid rgba(251,191,36,0.25);
-        color: #fcd34d;
-    }
-    .badge-chat {
-        background: linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.08));
-        border: 1px solid rgba(255,255,255,0.12);
-        color: rgba(255,255,255,0.6);
-    }
-
-    /* ── Sonuç sayısı etiketi ── */
-    .result-count {
-        display: inline-block;
-        background: rgba(52,211,153,0.1);
-        border: 1px solid rgba(52,211,153,0.2);
-        color: #6ee7b7;
-        padding: 0.2rem 0.6rem;
-        border-radius: 8px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        margin-bottom: 0.5rem;
-    }
-
     /* ── Örnek soru butonları ── */
     [data-testid="stSidebar"] .stButton > button {
         background: rgba(255,255,255,0.04) !important;
@@ -330,133 +308,86 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────── MCP CLIENT ───────────────
+
+# ─────────────── MCP + GEMINI ───────────────
 
 
-def _build_context(max_turns: int = 5) -> str:
-    """Son N tur mesajdan konuşma bağlamı oluşturur."""
-    messages = st.session_state.get("messages", [])
-    if not messages:
-        return ""
-
-    recent = messages[-(max_turns * 2):]  # user+assistant çiftleri
-    lines = []
-    for msg in recent:
-        role = "Kullanıcı" if msg["role"] == "user" else "Asistan"
-        # Çok uzun cevapları kısalt
-        content = msg["content"][:300] if msg["role"] == "assistant" else msg["content"]
-        lines.append(f"{role}: {content}")
-
-    return "\n".join(lines)
-
-
-def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
-    """MCP Server'daki bir tool'u çağırır."""
-    log.info(f"MCP tool çağrısı: {tool_name}({arguments})")
-
+async def ask_gemini_with_mcp(user_message: str, chat_history: list) -> str:
+    """
+    MCP Server'a bağlanıp Gemini'ye tool'ları vererek cevap alır.
+    Gemini otomatik olarak gerekli tool'ları çağırır.
+    """
     try:
-        with httpx.Client(timeout=60.0) as client:
-            response = client.post(
-                f"{MCP_SERVER_URL}/call-tool",
-                json={"name": tool_name, "arguments": arguments}
-            )
-            response.raise_for_status()
-            return response.json()
+        async with sse_client(MCP_SSE_URL) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                log.info("MCP session başlatıldı")
 
-    except httpx.ConnectError:
-        log.error("MCP Server'a bağlanılamadı")
-        return {"error": "MCP Server'a bağlanılamadı. docker-compose up çalıştırıldığından emin olun."}
+                # Chat geçmişini Content formatına çevir
+                contents = []
+                for msg in chat_history:
+                    role = "user" if msg["role"] == "user" else "model"
+                    contents.append(
+                        types.Content(
+                            role=role,
+                            parts=[types.Part.from_text(text=msg["content"])]
+                        )
+                    )
+
+                # Mevcut kullanıcı mesajını ekle
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=user_message)]
+                    )
+                )
+
+                # Gemini'ye MCP session'ı tool olarak ver
+                response = await genai_client.aio.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.7,
+                        tools=[session],
+                    ),
+                )
+
+                log.info(f"Gemini cevap verdi: {response.text[:100] if response.text else 'boş'}...")
+                return response.text or "Üzgünüm, bir cevap oluşturamadım. Lütfen tekrar deneyin."
+
     except Exception as e:
-        log.error(f"MCP tool hatası: {e}")
-        return {"error": str(e)}
+        log.error(f"MCP/Gemini hatası: {e}")
+        return f"❌ Bir hata oluştu: {str(e)}\n\nMCP Server'ın çalıştığından emin olun."
 
 
-def decide_tool(question: str) -> tuple[str, dict]:
-    """Kullanıcı sorusuna göre hangi MCP tool'un çağrılacağına karar verir."""
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    context = _build_context()
-
-    context_block = ""
-    if context:
-        context_block = f"""\n\nÖnceki konuşma bağlamı:
----
-{context}
----
-Yukarıdaki bağlamı dikkate al. Kullanıcı önceki konuşmaya atıf yapıyor olabilir."""
-
-    prompt = f"""Kullanıcı şu soruyu sordu: "{question}"{context_block}
-
-Bu soruyu yanıtlamak için aşağıdaki araçlardan hangisi kullanılmalı?
-
-1. sql_query - Sayısal, istatistiksel, filtreleme soruları için (fiyat, adet, ortalama, liste, sıralama)
-   Örnek: "En ucuz 5 BMW", "İstanbul'da kaç ilan var", "Ortalama fiyat nedir"
-
-2. search_similar_cars - Açıklayıcı, subjektif aramalar için (benzerlik, öneri, tip bazlı)
-   Örnek: "Aile için geniş SUV", "Ekonomik şehir aracı", "Spor araba önerisi"
-
-3. get_car_details - Spesifik ilan detayı (ilan numarası verildiğinde)
-   Örnek: "12345 nolu ilan", "Bu ilanın detayları"
-
-4. get_database_stats - Genel istatistik soruları
-   Örnek: "Kaç ilan var", "Veritabanı durumu"
-
-5. none - Araçla ilgisi olmayan genel sohbet
-
-SADECE araç adını döndür (sql_query, search_similar_cars, get_car_details, get_database_stats veya none).
-Başka bir şey yazma."""
-
-    response = model.generate_content(prompt)
-    tool = response.text.strip().lower().replace("`", "")
-
-    # Konuşma bağlamını sql_query'ye ekle
-    if tool == "sql_query":
-        return "sql_query", {"question": question, "context": context}
-    elif tool == "search_similar_cars":
-        return "search_similar_cars", {"query": question, "limit": 10}
-    elif tool == "get_car_details":
-        import re
-        m = re.search(r"(\d{5,})", question)
-        ilan_id = m.group(1) if m else question
-        return "get_car_details", {"ilan_id": ilan_id}
-    elif tool == "get_database_stats":
-        return "get_database_stats", {}
-    else:
-        return "none", {}
+def get_sidebar_stats() -> dict:
+    """Sidebar için veritabanı istatistiklerini çeker (httpx ile, MCP session dışında)."""
+    import httpx
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            # MCP SSE üzerinden doğrudan tool çağrısı yapamayız sidebar'da,
+            # bu yüzden async MCP session kullanıyoruz
+            pass
+    except Exception:
+        pass
+    return {}
 
 
-def get_badge_html(tool_name: str) -> str:
-    """Tool tipine göre badge HTML döner."""
-    badges = {
-        "sql_query": '<div class="search-badge badge-sql">📊 Veritabanı Sorgusu</div>',
-        "search_similar_cars": '<div class="search-badge badge-semantic">🧠 Akıllı Arama</div>',
-        "get_car_details": '<div class="search-badge badge-detail">🔎 İlan Detayı</div>',
-        "get_database_stats": '<div class="search-badge badge-stats">📈 İstatistikler</div>',
-        "none": '<div class="search-badge badge-chat">💬 Sohbet</div>',
-    }
-    return badges.get(tool_name, "")
-
-
-def format_semantic_results(data: dict) -> str:
-    """Semantik arama sonuçlarını kart formatında döner."""
-    if "error" in data:
-        return f"❌ Hata: {data['error']}"
-
-    results = data.get("results", [])
-    if not results:
-        return "Bu kriterlere uygun araç bulunamadı. 🔍"
-
-    cards = []
-    for i, car in enumerate(results, 1):
-        fiyat = f"{int(car.get('fiyat', 0)):,}".replace(",", ".") if car.get("fiyat") else "?"
-        km = f"{int(car.get('kilometre', 0)):,}".replace(",", ".") if car.get("kilometre") else "?"
-        score = f"{car.get('score', 0) * 100:.0f}%"
-
-        card = f"""**{i}. {car.get('marka', '')} {car.get('seri', '')} {car.get('model', '')}**
-🗓️ {car.get('yil', '?')} · 🛣️ {km} km · ⛽ {car.get('yakit_tipi', '?')} · 🔧 {car.get('vites_tipi', '?')}
-💰 **{fiyat} TL** · 📍 {car.get('il', '?')} · 🎯 Benzerlik: {score}"""
-        cards.append(card)
-
-    return "\n\n---\n\n".join(cards)
+async def get_stats_via_mcp() -> dict:
+    """MCP üzerinden veritabanı istatistiklerini çeker."""
+    try:
+        async with sse_client(MCP_SSE_URL) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool("veritabani_ozeti", {})
+                # MCP tool sonucu TextContent listesi olarak döner
+                if result.content and len(result.content) > 0:
+                    text = result.content[0].text
+                    return json.loads(text)
+    except Exception as e:
+        log.error(f"Stats hatası: {e}")
+    return {}
 
 
 # ─────────────── SESSION ───────────────
@@ -464,12 +395,11 @@ def format_semantic_results(data: dict) -> str:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "gemini_chat" not in st.session_state:
+if "stats" not in st.session_state:
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        st.session_state.gemini_chat = model.start_chat(history=[])
+        st.session_state.stats = asyncio.run(get_stats_via_mcp())
     except Exception:
-        st.session_state.gemini_chat = None
+        st.session_state.stats = {}
 
 
 # ─────────────── SIDEBAR ───────────────
@@ -485,48 +415,45 @@ with st.sidebar:
     st.markdown('<div class="subtle-divider"></div>', unsafe_allow_html=True)
 
     # İstatistikler
-    try:
-        stats = call_mcp_tool("get_database_stats", {})
-        if "error" not in stats:
-            mysql_stats = stats.get("mysql", {})
-            qdrant_stats = stats.get("qdrant", {})
+    stats = st.session_state.get("stats", {})
+    mysql_stats = stats.get("mysql", {})
+    qdrant_stats = stats.get("qdrant", {})
 
-            toplam = mysql_stats.get('toplam_ilan', 0)
-            marka = mysql_stats.get('marka_sayisi', 0)
-            vektor = qdrant_stats.get('points_count', 0)
-            min_f = mysql_stats.get('min_fiyat', 0)
-            max_f = mysql_stats.get('max_fiyat', 0)
+    if mysql_stats:
+        toplam = mysql_stats.get('toplam_ilan', 0)
+        marka = mysql_stats.get('marka_sayisi', 0)
+        vektor = qdrant_stats.get('points_count', 0) if isinstance(qdrant_stats, dict) else 0
+        min_f = mysql_stats.get('min_fiyat', 0)
+        max_f = mysql_stats.get('max_fiyat', 0)
 
-            st.markdown(f"""
-            <div class="stat-grid">
-                <div class="stat-card">
-                    <span class="stat-icon">🚗</span>
-                    <span class="stat-value">{toplam:,}</span>
-                    <span class="stat-label">İlan</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-icon">🏷️</span>
-                    <span class="stat-value">{marka}</span>
-                    <span class="stat-label">Marka</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-icon">🧠</span>
-                    <span class="stat-value">{vektor:,}</span>
-                    <span class="stat-label">Vektör</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-icon">📅</span>
-                    <span class="stat-value">{mysql_stats.get('min_yil', 0)}—{mysql_stats.get('max_yil', 0)}</span>
-                    <span class="stat-label">Yıl Aralığı</span>
-                </div>
+        st.markdown(f"""
+        <div class="stat-grid">
+            <div class="stat-card">
+                <span class="stat-icon">🚗</span>
+                <span class="stat-value">{toplam:,}</span>
+                <span class="stat-label">İlan</span>
             </div>
-            <div class="stat-card-wide">
-                <span class="stat-label">💰 Fiyat Aralığı</span><br>
-                <span class="stat-value">{min_f:,} — {max_f:,} TL</span>
+            <div class="stat-card">
+                <span class="stat-icon">🏷️</span>
+                <span class="stat-value">{marka}</span>
+                <span class="stat-label">Marka</span>
             </div>
-            """, unsafe_allow_html=True)
-    except Exception as e:
-        st.error(f"İstatistik hatası: {e}")
+            <div class="stat-card">
+                <span class="stat-icon">🧠</span>
+                <span class="stat-value">{vektor:,}</span>
+                <span class="stat-label">Vektör</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-icon">📅</span>
+                <span class="stat-value">{mysql_stats.get('min_yil', 0)}—{mysql_stats.get('max_yil', 0)}</span>
+                <span class="stat-label">Yıl Aralığı</span>
+            </div>
+        </div>
+        <div class="stat-card-wide">
+            <span class="stat-label">💰 Fiyat Aralığı</span><br>
+            <span class="stat-value">{min_f:,} — {max_f:,} TL</span>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown('<div class="subtle-divider"></div>', unsafe_allow_html=True)
     st.markdown("##### 💡 Örnek Sorular")
@@ -549,10 +476,10 @@ with st.sidebar:
 
     st.markdown("""
     <div class="tech-bar" style="justify-content: center;">
-        <span class="tech-chip">Gemini</span>
+        <span class="tech-chip">Gemini 2.5</span>
         <span class="tech-chip">Qdrant</span>
         <span class="tech-chip">MySQL</span>
-        <span class="tech-chip">MCP</span>
+        <span class="tech-chip">FastMCP</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -572,8 +499,8 @@ st.markdown("""
     <p>Binlerce araç ilanını doğal dilde sorgula</p>
 </div>
 <div class="tech-bar">
-    <span class="tech-chip">📊 SQL Sorguları</span>
-    <span class="tech-chip">🧠 Semantik Arama</span>
+    <span class="tech-chip">🛠️ MCP Tools</span>
+    <span class="tech-chip">🧠 Gemini Function Calling</span>
     <span class="tech-chip">🤖 AI Destekli</span>
 </div>
 """, unsafe_allow_html=True)
@@ -608,9 +535,6 @@ if not st.session_state.messages:
 # Chat geçmişi
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        # Arama modu badge'i
-        if msg["role"] == "assistant" and "badge" in msg:
-            st.markdown(msg["badge"], unsafe_allow_html=True)
         st.markdown(msg["content"])
 
 # Örnek soru
@@ -632,163 +556,24 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("🤔 Düşünüyorum..."):
             try:
-                # Hangi tool kullanılacak?
-                tool_name, tool_args = decide_tool(prompt)
-                log.info(f"Seçilen tool: {tool_name}")
+                # Gemini + MCP ile cevap al
+                answer = asyncio.run(
+                    ask_gemini_with_mcp(prompt, st.session_state.messages[:-1])
+                )
 
-                badge_html = get_badge_html(tool_name)
-                if badge_html:
-                    st.markdown(badge_html, unsafe_allow_html=True)
-
-                if tool_name == "none":
-                    # Genel sohbet
-                    if st.session_state.gemini_chat:
-                        resp = st.session_state.gemini_chat.send_message(prompt)
-                        answer = resp.text
-                    else:
-                        answer = "Merhaba! Size araç ilanları hakkında yardımcı olabilirim. 🚗"
-
-                    st.markdown(answer)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "badge": badge_html
-                    })
-
-                elif tool_name == "sql_query":
-                    result = call_mcp_tool("sql_query", tool_args)
-
-                    if "error" in result:
-                        st.error(f"❌ {result['error']}")
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": f"❌ {result['error']}",
-                            "badge": badge_html
-                        })
-                    else:
-                        # Sonuçları Gemini ile özetle
-                        row_count = result.get('row_count', 0)
-                        summary_prompt = f"""Kullanıcı: "{prompt}"
-Sonuçlar ({row_count} satır):
-{json.dumps(result.get('results', [])[:15], ensure_ascii=False, indent=2)}
-
-Bu sonuçları Türkçe olarak doğal ve anlaşılır şekilde açıkla. 
-Sayıları okunabilir yaz (845.000 TL, 120.000 km). Kısa ve öz ol. Emoji kullan.
-Eğer birden fazla araç varsa, okunabilir bir liste formatında sun."""
-
-                        if st.session_state.gemini_chat:
-                            resp = st.session_state.gemini_chat.send_message(summary_prompt)
-                            summary = resp.text
-                        else:
-                            summary = f"**{row_count} sonuç bulundu.**"
-
-                        # Sonuç sayısı
-                        if row_count > 0:
-                            st.markdown(
-                                f'<div class="result-count">✅ {row_count} sonuç bulundu</div>',
-                                unsafe_allow_html=True
-                            )
-
-                        st.markdown(summary)
-
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": summary,
-                            "badge": badge_html
-                        })
-
-                elif tool_name == "search_similar_cars":
-                    result = call_mcp_tool("search_similar_cars", tool_args)
-
-                    if "error" in result:
-                        st.error(f"❌ {result['error']}")
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": f"❌ {result['error']}",
-                            "badge": badge_html
-                        })
-                    else:
-                        result_count = result.get("result_count", 0)
-                        summary_prompt = f"""Kullanıcı "{prompt}" diye araç arıyor.
-Semantik arama sonuçları (en benzer araçlar):
-{json.dumps(result.get('results', [])[:8], ensure_ascii=False, indent=2)}
-
-Bu araçları kullanıcıya Türkçe olarak öner. Her araç için kısa bir açıklama yaz.
-Neden bu araçların uygun olduğunu açıkla. Fiyatları okunabilir yaz. Emoji kullan."""
-
-                        if st.session_state.gemini_chat:
-                            resp = st.session_state.gemini_chat.send_message(summary_prompt)
-                            summary = resp.text
-                        else:
-                            summary = format_semantic_results(result)
-
-                        if result_count > 0:
-                            st.markdown(
-                                f'<div class="result-count">🎯 {result_count} benzer araç bulundu</div>',
-                                unsafe_allow_html=True
-                            )
-
-                        st.markdown(summary)
-
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": summary,
-                            "badge": badge_html
-                        })
-
-                elif tool_name == "get_car_details":
-                    result = call_mcp_tool("get_car_details", tool_args)
-
-                    if "error" in result:
-                        st.error(f"❌ {result['error']}")
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": f"❌ {result['error']}",
-                            "badge": badge_html
-                        })
-                    else:
-                        detail_text = json.dumps(result, ensure_ascii=False, indent=2)
-
-                        if st.session_state.gemini_chat:
-                            resp = st.session_state.gemini_chat.send_message(
-                                f"Bu araç ilanının detaylarını Türkçe olarak güzel, okunabilir bir şekilde özetle. Emoji kullan:\n{detail_text}"
-                            )
-                            summary = resp.text
-                        else:
-                            summary = f"```json\n{detail_text}\n```"
-
-                        st.markdown(summary)
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": summary,
-                            "badge": badge_html
-                        })
-
-                elif tool_name == "get_database_stats":
-                    result = call_mcp_tool("get_database_stats", {})
-                    detail_text = json.dumps(result, ensure_ascii=False, indent=2)
-
-                    if st.session_state.gemini_chat:
-                        resp = st.session_state.gemini_chat.send_message(
-                            f"Bu veritabanı istatistiklerini Türkçe olarak güzel bir şekilde özetle. Emoji kullan:\n{detail_text}"
-                        )
-                        summary = resp.text
-                    else:
-                        summary = f"```json\n{detail_text}\n```"
-
-                    st.markdown(summary)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": summary,
-                        "badge": badge_html
-                    })
+                st.markdown(answer)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer
+                })
 
             except Exception as e:
                 log.error(f"Hata: {e}")
-                st.error(f"❌ Bir hata oluştu. Lütfen tekrar deneyin.")
+                error_msg = "❌ Bir hata oluştu. Lütfen tekrar deneyin."
+                st.error(error_msg)
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": f"❌ Bir hata oluştu. Lütfen tekrar deneyin."
+                    "content": error_msg
                 })
 
     st.rerun()

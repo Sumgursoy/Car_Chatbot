@@ -29,7 +29,7 @@ DB_CONFIG = {
     "password": os.getenv("MYSQL_PASSWORD", ""),
 }
 DB_NAME   = os.getenv("MYSQL_DATABASE", "arabam_chatbot")
-DATA_FILE = "data/arabam_dataset.json"
+DATA_FILE = r"C:\Users\sumgu\OneDrive\Masaüstü\car chatbot\data\arabam_dataset_clean.json"
 
 # ─────────────────────────── SCHEMA ───────────────────────────
 
