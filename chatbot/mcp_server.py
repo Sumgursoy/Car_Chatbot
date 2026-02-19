@@ -389,7 +389,185 @@ def il_dagilimi(marka: str = "", limit: int = 10) -> str:
         return json.dumps({"hata": str(e)}, ensure_ascii=False)
 
 
-# ─────────────── TOOL 8: benzer_arac_bul ───────────────
+# ─────────────── RRF Reranker ───────────────
+
+def rrf_merge(sql_results: list[dict], semantic_results: list[dict], k: int = 60) -> list[dict]:
+    """Reciprocal Rank Fusion ile iki sonuç listesini birleştirir.
+    Tam eşleşmeler (SQL) her zaman semantik benzerliklerden önce gelir."""
+    scores = {}
+
+    for rank, item in enumerate(sql_results):
+        key = str(item.get("ilan_id", ""))
+        if not key:
+            continue
+        if key not in scores:
+            scores[key] = {"score": 0.0, "data": item, "sources": []}
+        scores[key]["score"] += 1.0 / (k + rank + 1)
+        scores[key]["sources"].append("keyword")
+
+    for rank, item in enumerate(semantic_results):
+        key = str(item.get("ilan_id", ""))
+        if not key:
+            continue
+        if key not in scores:
+            scores[key] = {"score": 0.0, "data": item, "sources": []}
+        scores[key]["score"] += 1.0 / (k + rank + 1)
+        scores[key]["sources"].append("semantic")
+
+    merged = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+    return merged
+
+
+# ─────────────── TOOL 8: hibrit_arac_ara ───────────────
+
+@mcp.tool
+def hibrit_arac_ara(
+    sorgu: str,
+    marka: str = "",
+    min_fiyat: int = 0,
+    max_fiyat: int = 0,
+    min_yil: int = 0,
+    max_yil: int = 0,
+    yakit_tipi: str = "",
+    vites_tipi: str = "",
+    limit: int = 10,
+) -> str:
+    """Hibrit arama: Doğal dil sorgusunu hem anahtar kelime (SQL) hem de semantik (Qdrant) olarak arar ve sonuçları birleştirir.
+    Tam eşleşmeler (marka/model adı) her zaman en üstte yer alır.
+    Kullanıcı bir araç adı, marka, model veya doğal dil açıklaması yazdığında bu tool kullanılmalıdır.
+    Örnek: 'Astra', 'ekonomik SUV', 'beyaz BMW sedan', 'aile aracı'"""
+    log.info(f"hibrit_arac_ara: sorgu='{sorgu}', marka={marka}")
+
+    safe_limit = min(max(1, limit), 30)
+    fetch_limit = safe_limit * 2  # Her kaynaktan daha fazla çekip RRF ile kırpacağız
+
+    # ── 1. SQL Keyword Search ──
+    sql_results = []
+    try:
+        # Sorguyu kelimelere ayır
+        keywords = [w.strip() for w in sorgu.split() if len(w.strip()) >= 2]
+        if keywords:
+            like_conditions = []
+            for kw in keywords:
+                safe_kw = kw.replace("'", "''").replace("%", "\\%")
+                like_conditions.append(
+                    f"(i.baslik LIKE '%{safe_kw}%' OR m.ad LIKE '%{safe_kw}%' "
+                    f"OR ser.ad LIKE '%{safe_kw}%' OR modl.ad LIKE '%{safe_kw}%' "
+                    f"OR i.ilan_aciklamasi LIKE '%{safe_kw}%')"
+                )
+
+            # Ek filtreler
+            extra_conditions = build_conditions(
+                marka=marka, yakit_tipi=yakit_tipi, vites_tipi=vites_tipi,
+                min_fiyat=min_fiyat, max_fiyat=max_fiyat,
+                min_yil=min_yil, max_yil=max_yil
+            )
+
+            all_conditions = like_conditions + extra_conditions
+            where = "WHERE " + " AND ".join(all_conditions)
+
+            sql = f"""
+                SELECT i.ilan_id, i.baslik, m.ad AS marka, ser.ad AS seri, modl.ad AS model,
+                       i.fiyat, i.yil, i.kilometre,
+                       yt.ad AS yakit_tipi, vt.ad AS vites_tipi, kt.ad AS kasa_tipi,
+                       r.ad AS renk, il.ad AS il
+                {BASE_JOIN}
+                {where}
+                ORDER BY i.fiyat ASC
+                LIMIT {fetch_limit}
+            """
+            columns, rows = execute_query(sql)
+            sql_results = [
+                dict(zip(columns, [str(v) if v is not None else None for v in row]))
+                for row in rows
+            ]
+            log.info(f"  SQL keyword araması: {len(sql_results)} sonuç")
+    except Exception as e:
+        log.error(f"  SQL keyword arama hatası: {e}")
+
+    # ── 2. Qdrant Semantic Search ──
+    semantic_results = []
+    try:
+        result = genai.embed_content(
+            model=EMBED_MODEL,
+            content=sorgu,
+            task_type="retrieval_query"
+        )
+        query_vector = result['embedding']
+
+        # Qdrant filtreleri
+        qdrant_filters = {}
+        if marka:
+            qdrant_filters["marka"] = marka
+        if min_fiyat > 0:
+            qdrant_filters["fiyat_min"] = min_fiyat
+        if max_fiyat > 0:
+            qdrant_filters["fiyat_max"] = max_fiyat
+        if min_yil > 0:
+            qdrant_filters["yil_min"] = min_yil
+        if max_yil > 0:
+            qdrant_filters["yil_max"] = max_yil
+        if yakit_tipi:
+            qdrant_filters["yakit_tipi"] = yakit_tipi
+
+        hits = semantic_search(
+            query_vector,
+            limit=fetch_limit,
+            filters=qdrant_filters if qdrant_filters else None
+        )
+
+        for h in hits:
+            p = h["payload"]
+            semantic_results.append({
+                "ilan_id": str(p.get("ilan_id", "")),
+                "baslik": p.get("baslik", ""),
+                "marka": p.get("marka", ""),
+                "seri": p.get("seri", ""),
+                "model": p.get("model", ""),
+                "yil": str(p.get("yil", "")) if p.get("yil") else None,
+                "fiyat": str(p.get("fiyat", "")) if p.get("fiyat") else None,
+                "kilometre": str(p.get("kilometre", "")) if p.get("kilometre") else None,
+                "yakit_tipi": p.get("yakit_tipi", ""),
+                "vites_tipi": p.get("vites_tipi", ""),
+                "kasa_tipi": p.get("kasa_tipi", ""),
+                "renk": p.get("renk", ""),
+                "il": p.get("il", ""),
+                "_semantic_score": round(h["score"], 4),
+            })
+        log.info(f"  Semantik arama: {len(semantic_results)} sonuç")
+    except Exception as e:
+        log.error(f"  Semantik arama hatası: {e}")
+
+    # ── 3. RRF Merge ──
+    if not sql_results and not semantic_results:
+        return json.dumps({"sonuc_sayisi": 0, "sonuclar": [], "mesaj": "Sonuç bulunamadı"}, ensure_ascii=False)
+
+    merged = rrf_merge(sql_results, semantic_results)
+
+    # Sonuçları düzenle
+    final = []
+    for item in merged[:safe_limit]:
+        entry = item["data"].copy()
+        entry["_kaynaklar"] = "+".join(item["sources"])
+        entry["_rrf_skor"] = round(item["score"], 6)
+        # _semantic_score iç alanını kaldır
+        entry.pop("_semantic_score", None)
+        final.append(entry)
+
+    log.info(f"  Hibrit sonuç: {len(final)} ilan (SQL: {len(sql_results)}, Semantic: {len(semantic_results)})")
+
+    return json.dumps({
+        "sonuc_sayisi": len(final),
+        "arama_bilgisi": {
+            "sql_sonuc": len(sql_results),
+            "semantik_sonuc": len(semantic_results),
+            "birlesik_sonuc": len(final)
+        },
+        "sonuclar": final
+    }, ensure_ascii=False)
+
+
+# ─────────────── TOOL 9: benzer_arac_bul ───────────────
 
 @mcp.tool
 def benzer_arac_bul(aciklama: str, limit: int = 10) -> str:
@@ -471,6 +649,6 @@ if __name__ == "__main__":
     log.info(f"✅ FastMCP Server çalışıyor: http://0.0.0.0:{PORT}/mcp")
     log.info(f"   Tools: araba_ara, ilan_detay_getir, fiyat_istatistikleri, "
              f"marka_seri_listele, ilan_sayisi, renk_dagilimi, "
-             f"il_dagilimi, benzer_arac_bul, veritabani_ozeti")
+             f"il_dagilimi, hibrit_arac_ara, benzer_arac_bul, veritabani_ozeti")
 
     mcp.run(transport="sse", host="0.0.0.0", port=PORT)
