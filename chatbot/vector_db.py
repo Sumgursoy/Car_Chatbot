@@ -5,7 +5,7 @@ Qdrant Vektör Veritabanı Yöneticisi
 - Collection oluşturma
 - Semantik arama
 """
-
+ 
 import os
 from qdrant_client import QdrantClient
 from qdrant_client.models import (

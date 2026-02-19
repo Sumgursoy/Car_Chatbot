@@ -34,12 +34,20 @@ def get_pool():
     return _pool
 
 
-def execute_query(sql: str) -> tuple:
+def execute_query(sql: str, params: dict = None) -> tuple:
     """
     Güvenli SQL çalıştır — sadece SELECT izinli.
+    Parameterized queries desteği ile SQL Injection korumalı.
+    
+    Args:
+        sql: SQL sorgusu (%(param_name)s formatında placeholders)
+        params: Parametreler dictionary
+    
     Returns: (columns, rows)
     """
     log.info(f"SQL çalıştırılıyor: {sql[:200]}")
+    if params:
+        log.debug(f"Parametreler: {params}")
 
     # Güvenlik: sadece SELECT sorgularına izin ver
     cleaned = sql.strip().upper()
@@ -56,7 +64,8 @@ def execute_query(sql: str) -> tuple:
     conn = get_pool().get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute(sql)
+        # Parameterized query kullan
+        cursor.execute(sql, params or {})
         columns = [desc[0] for desc in cursor.description] if cursor.description else []
         rows = cursor.fetchall()
         cursor.close()

@@ -59,37 +59,60 @@ SHORT_JOIN = """
 def build_conditions(marka="", seri="", model="", yakit_tipi="", vites_tipi="",
                      kasa_tipi="", renk="", il="", min_fiyat=0, max_fiyat=0,
                      min_yil=0, max_yil=0, min_km=0, max_km=0):
-    """Filtre parametrelerinden WHERE koşulları oluşturur."""
+    """
+    Filtre parametrelerinden WHERE koşulları oluşturur.
+    SQL Injection korumalı - parameterized queries kullanır.
+    
+    Returns:
+        (conditions_list, params_dict)
+    """
     conditions = []
+    params = {}
+    
     if marka:
-        conditions.append(f"m.ad = '{marka}'")
+        conditions.append("m.ad = %(marka)s")
+        params['marka'] = marka
     if seri:
-        conditions.append(f"ser.ad = '{seri}'")
+        conditions.append("ser.ad = %(seri)s")
+        params['seri'] = seri
     if model:
-        conditions.append(f"modl.ad = '{model}'")
+        conditions.append("modl.ad = %(model)s")
+        params['model'] = model
     if yakit_tipi:
-        conditions.append(f"yt.ad = '{yakit_tipi}'")
+        conditions.append("yt.ad = %(yakit_tipi)s")
+        params['yakit_tipi'] = yakit_tipi
     if vites_tipi:
-        conditions.append(f"vt.ad = '{vites_tipi}'")
+        conditions.append("vt.ad = %(vites_tipi)s")
+        params['vites_tipi'] = vites_tipi
     if kasa_tipi:
-        conditions.append(f"kt.ad = '{kasa_tipi}'")
+        conditions.append("kt.ad = %(kasa_tipi)s")
+        params['kasa_tipi'] = kasa_tipi
     if renk:
-        conditions.append(f"r.ad = '{renk}'")
+        conditions.append("r.ad = %(renk)s")
+        params['renk'] = renk
     if il:
-        conditions.append(f"il.ad = '{il}'")
+        conditions.append("il.ad = %(il)s")
+        params['il'] = il
     if min_fiyat > 0:
-        conditions.append(f"i.fiyat >= {min_fiyat}")
+        conditions.append("i.fiyat >= %(min_fiyat)s")
+        params['min_fiyat'] = min_fiyat
     if max_fiyat > 0:
-        conditions.append(f"i.fiyat <= {max_fiyat}")
+        conditions.append("i.fiyat <= %(max_fiyat)s")
+        params['max_fiyat'] = max_fiyat
     if min_yil > 0:
-        conditions.append(f"i.yil >= {min_yil}")
+        conditions.append("i.yil >= %(min_yil)s")
+        params['min_yil'] = min_yil
     if max_yil > 0:
-        conditions.append(f"i.yil <= {max_yil}")
+        conditions.append("i.yil <= %(max_yil)s")
+        params['max_yil'] = max_yil
     if min_km > 0:
-        conditions.append(f"i.kilometre >= {min_km}")
+        conditions.append("i.kilometre >= %(min_km)s")
+        params['min_km'] = min_km
     if max_km > 0:
-        conditions.append(f"i.kilometre <= {max_km}")
-    return conditions
+        conditions.append("i.kilometre <= %(max_km)s")
+        params['max_km'] = max_km
+    
+    return conditions, params
 
 
 # ─────────────── TOOL 1: araba_ara ───────────────
@@ -116,7 +139,7 @@ def araba_ara(
     """Filtrelere göre araç ilanı arar. Marka, fiyat aralığı, yıl, yakıt tipi gibi kriterlere göre araç listesi döner."""
     log.info(f"araba_ara: marka={marka}, max_fiyat={max_fiyat}, yakit={yakit_tipi}")
 
-    conditions = build_conditions(marka=marka, seri=seri, model=model,
+    conditions, params = build_conditions(marka=marka, seri=seri, model=model,
                                   yakit_tipi=yakit_tipi, vites_tipi=vites_tipi,
                                   kasa_tipi=kasa_tipi, renk=renk, il=il,
                                   min_fiyat=min_fiyat, max_fiyat=max_fiyat,
@@ -135,6 +158,9 @@ def araba_ara(
     }
     order = order_map.get(siralama, "i.fiyat ASC")
     safe_limit = min(max(1, limit), 50)
+    
+    # Limit parametresini ekle
+    params['limit'] = safe_limit
 
     sql = f"""
         SELECT i.ilan_id, i.baslik, m.ad AS marka, ser.ad AS seri, modl.ad AS model,
@@ -144,10 +170,10 @@ def araba_ara(
         {BASE_JOIN}
         {where}
         ORDER BY {order}
-        LIMIT {safe_limit}
+        LIMIT %(limit)s
     """
     try:
-        columns, rows = execute_query(sql)
+        columns, rows = execute_query(sql, params)
         results = [dict(zip(columns, [str(v) if v is not None else None for v in row])) for row in rows]
         return json.dumps({"sonuc_sayisi": len(results), "sonuclar": results}, ensure_ascii=False)
     except Exception as e:
@@ -165,16 +191,16 @@ def ilan_detay_getir(ilan_id: str) -> str:
     log.info(f"ilan_detay_getir: {ilan_id}")
 
     # Küçük sayıysa önce veritabanı id'sine bak, bulamazsa ilan_id'ye bak
-    search_conditions = []
+    search_queries = []
     try:
         numeric_id = int(str(ilan_id).strip())
         if numeric_id < 100000:
-            search_conditions.append(f"i.id = {numeric_id}")
-        search_conditions.append(f"i.ilan_id = '{ilan_id}'")
+            search_queries.append(("i.id = %(id)s", {"id": numeric_id}))
+        search_queries.append(("i.ilan_id = %(ilan_id)s", {"ilan_id": str(ilan_id)}))
     except ValueError:
-        search_conditions.append(f"i.ilan_id = '{ilan_id}'")
+        search_queries.append(("i.ilan_id = %(ilan_id)s", {"ilan_id": str(ilan_id)}))
 
-    for condition in search_conditions:
+    for condition, params in search_queries:
         sql = f"""
             SELECT i.id AS db_id, i.ilan_id, i.baslik, i.fiyat, i.yil, i.kilometre,
                    i.motor_hacmi_cc, i.motor_gucu_hp,
@@ -187,26 +213,27 @@ def ilan_detay_getir(ilan_id: str) -> str:
             LIMIT 1
         """
         try:
-            columns, rows = execute_query(sql)
+            columns, rows = execute_query(sql, params)
             if rows:
                 result = dict(zip(columns, [str(v) if v is not None else None for v in rows[0]]))
                 found_ilan_id = result.get("ilan_id", ilan_id)
 
                 # Boya detayları
                 try:
-                    bcols, brows = execute_query(f"""
+                    boya_sql = """
                         SELECT bd.parca_adi, bd.durum
                         FROM boya_detaylari bd
                         JOIN ilanlar i ON bd.ilan_db_id = i.id
-                        WHERE i.ilan_id = '{found_ilan_id}'
-                    """)
+                        WHERE i.ilan_id = %(ilan_id)s
+                    """
+                    bcols, brows = execute_query(boya_sql, {"ilan_id": found_ilan_id})
                     result["boya_detaylari"] = [dict(zip(bcols, row)) for row in brows]
                 except Exception:
                     result["boya_detaylari"] = []
 
                 return json.dumps(result, ensure_ascii=False)
         except Exception as e:
-            log.error(f"ilan_detay_getir hatası ({condition}): {e}")
+            log.error(f"ilan_detay_getir hatası: {e}")
             continue
 
     return json.dumps({"hata": "İlan bulunamadı"}, ensure_ascii=False)
@@ -229,10 +256,12 @@ def fiyat_istatistikleri(
     """Filtrelere göre araç fiyat istatistiklerini döner: minimum, maksimum, ortalama fiyat ve ilan sayısı. Marka, seri, yıl, yakıt tipi, vites tipi, kasa tipi, renk ve il bazında filtreleme yapılabilir."""
     log.info(f"fiyat_istatistikleri: marka={marka}, seri={seri}, vites={vites_tipi}")
 
-    conditions = ["i.fiyat > 0"]
-    conditions += build_conditions(marka=marka, seri=seri, yakit_tipi=yakit_tipi,
+    conditions, params = build_conditions(marka=marka, seri=seri, yakit_tipi=yakit_tipi,
                                    vites_tipi=vites_tipi, kasa_tipi=kasa_tipi,
                                    renk=renk, il=il, min_yil=min_yil, max_yil=max_yil)
+    
+    # Fiyat > 0 koşulunu ekle
+    conditions.insert(0, "i.fiyat > 0")
 
     where = "WHERE " + " AND ".join(conditions)
 
@@ -246,7 +275,7 @@ def fiyat_istatistikleri(
         {where}
     """
     try:
-        columns, rows = execute_query(sql)
+        columns, rows = execute_query(sql, params)
         result = dict(zip(columns, [str(v) if v is not None else None for v in rows[0]]))
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -263,26 +292,28 @@ def marka_seri_listele(marka: str = "", seri: str = "") -> str:
 
     try:
         if seri and marka:
-            sql = f"""
+            sql = """
                 SELECT DISTINCT modl.ad AS model, COUNT(*) as ilan_sayisi
                 FROM ilanlar i
                 JOIN markalar m ON i.marka_id = m.id
                 JOIN seriler ser ON i.seri_id = ser.id
                 JOIN modeller modl ON i.model_id = modl.id
-                WHERE m.ad = '{marka}' AND ser.ad = '{seri}'
+                WHERE m.ad = %(marka)s AND ser.ad = %(seri)s
                 GROUP BY modl.ad
                 ORDER BY ilan_sayisi DESC
             """
+            params = {"marka": marka, "seri": seri}
         elif marka:
-            sql = f"""
+            sql = """
                 SELECT DISTINCT ser.ad AS seri, COUNT(*) as ilan_sayisi
                 FROM ilanlar i
                 JOIN markalar m ON i.marka_id = m.id
                 JOIN seriler ser ON i.seri_id = ser.id
-                WHERE m.ad = '{marka}'
+                WHERE m.ad = %(marka)s
                 GROUP BY ser.ad
                 ORDER BY ilan_sayisi DESC
             """
+            params = {"marka": marka}
         else:
             sql = """
                 SELECT DISTINCT m.ad AS marka, COUNT(*) as ilan_sayisi
@@ -291,8 +322,9 @@ def marka_seri_listele(marka: str = "", seri: str = "") -> str:
                 GROUP BY m.ad
                 ORDER BY ilan_sayisi DESC
             """
+            params = {}
 
-        columns, rows = execute_query(sql)
+        columns, rows = execute_query(sql, params)
         results = [dict(zip(columns, [str(v) if v is not None else None for v in row])) for row in rows]
         return json.dumps({"sonuclar": results}, ensure_ascii=False)
     except Exception as e:
@@ -318,7 +350,7 @@ def ilan_sayisi(
     """Filtrelere göre kaç ilan olduğunu sayar."""
     log.info(f"ilan_sayisi: marka={marka}")
 
-    conditions = build_conditions(marka=marka, seri=seri, yakit_tipi=yakit_tipi,
+    conditions, params = build_conditions(marka=marka, seri=seri, yakit_tipi=yakit_tipi,
                                   vites_tipi=vites_tipi, kasa_tipi=kasa_tipi,
                                   il=il, min_yil=min_yil, max_yil=max_yil,
                                   min_fiyat=min_fiyat, max_fiyat=max_fiyat)
@@ -327,7 +359,7 @@ def ilan_sayisi(
 
     sql = f"SELECT COUNT(*) as toplam {BASE_JOIN} {where}"
     try:
-        columns, rows = execute_query(sql)
+        columns, rows = execute_query(sql, params)
         return json.dumps({"toplam": int(rows[0][0])}, ensure_ascii=False)
     except Exception as e:
         log.error(f"ilan_sayisi hatası: {e}")
@@ -341,7 +373,12 @@ def renk_dagilimi(marka: str = "") -> str:
     """İlanlardaki renk dağılımını gösterir. Opsiyonel olarak marka filtresi uygulanabilir."""
     log.info(f"renk_dagilimi: marka={marka}")
 
-    where = f"WHERE m.ad = '{marka}'" if marka else ""
+    if marka:
+        where = "WHERE m.ad = %(marka)s"
+        params = {"marka": marka}
+    else:
+        where = ""
+        params = {}
 
     sql = f"""
         SELECT r.ad AS renk, COUNT(*) as adet
@@ -353,7 +390,7 @@ def renk_dagilimi(marka: str = "") -> str:
         ORDER BY adet DESC
     """
     try:
-        columns, rows = execute_query(sql)
+        columns, rows = execute_query(sql, params)
         results = [dict(zip(columns, [str(v) if v is not None else None for v in row])) for row in rows]
         return json.dumps({"sonuclar": results}, ensure_ascii=False)
     except Exception as e:
@@ -368,8 +405,14 @@ def il_dagilimi(marka: str = "", limit: int = 10) -> str:
     """İlanların şehir bazlı dağılımını gösterir. Opsiyonel olarak marka filtresi uygulanabilir."""
     log.info(f"il_dagilimi: marka={marka}")
 
-    where = f"WHERE m.ad = '{marka}'" if marka else ""
     safe_limit = min(max(1, limit), 81)
+    
+    if marka:
+        where = "WHERE m.ad = %(marka)s"
+        params = {"marka": marka, "limit": safe_limit}
+    else:
+        where = ""
+        params = {"limit": safe_limit}
 
     sql = f"""
         SELECT il.ad AS il, COUNT(*) as adet
@@ -379,10 +422,10 @@ def il_dagilimi(marka: str = "", limit: int = 10) -> str:
         {where}
         GROUP BY il.ad
         ORDER BY adet DESC
-        LIMIT {safe_limit}
+        LIMIT %(limit)s
     """
     try:
-        columns, rows = execute_query(sql)
+        columns, rows = execute_query(sql, params)
         results = [dict(zip(columns, [str(v) if v is not None else None for v in row])) for row in rows]
         return json.dumps({"sonuclar": results}, ensure_ascii=False)
     except Exception as e:
@@ -449,21 +492,27 @@ def hibrit_arac_ara(
         keywords = [w.strip() for w in sorgu.split() if len(w.strip()) >= 2]
         if keywords:
             like_conditions = []
-            for kw in keywords:
-                safe_kw = kw.replace("'", "''").replace("%", "\\%")
+            like_params = {}
+            
+            # Her keyword için parameterized LIKE koşulu oluştur
+            for idx, kw in enumerate(keywords):
+                param_name = f"kw_{idx}"
+                like_params[param_name] = f"%{kw}%"
                 like_conditions.append(
-                    f"(i.baslik LIKE '%{safe_kw}%' OR m.ad LIKE '%{safe_kw}%' "
-                    f"OR ser.ad LIKE '%{safe_kw}%' OR modl.ad LIKE '%{safe_kw}%' "
-                    f"OR i.ilan_aciklamasi LIKE '%{safe_kw}%')"
+                    f"(i.baslik LIKE %({param_name})s OR m.ad LIKE %({param_name})s "
+                    f"OR ser.ad LIKE %({param_name})s OR modl.ad LIKE %({param_name})s "
+                    f"OR i.ilan_aciklamasi LIKE %({param_name})s)"
                 )
 
             # Ek filtreler
-            extra_conditions = build_conditions(
+            extra_conditions, extra_params = build_conditions(
                 marka=marka, yakit_tipi=yakit_tipi, vites_tipi=vites_tipi,
                 min_fiyat=min_fiyat, max_fiyat=max_fiyat,
                 min_yil=min_yil, max_yil=max_yil
             )
 
+            # Tüm parametreleri birleştir
+            all_params = {**like_params, **extra_params, "fetch_limit": fetch_limit}
             all_conditions = like_conditions + extra_conditions
             where = "WHERE " + " AND ".join(all_conditions)
 
@@ -475,9 +524,9 @@ def hibrit_arac_ara(
                 {BASE_JOIN}
                 {where}
                 ORDER BY i.fiyat ASC
-                LIMIT {fetch_limit}
+                LIMIT %(fetch_limit)s
             """
-            columns, rows = execute_query(sql)
+            columns, rows = execute_query(sql, all_params)
             sql_results = [
                 dict(zip(columns, [str(v) if v is not None else None for v in row]))
                 for row in rows
