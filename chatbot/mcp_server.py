@@ -158,43 +158,57 @@ def araba_ara(
 
 @mcp.tool
 def ilan_detay_getir(ilan_id: str) -> str:
-    """Belirli bir ilanın tüm detaylarını (boya durumu, tramer dahil) getirir."""
+    """Belirli bir ilanın tüm detaylarını (boya durumu, tramer dahil) getirir.
+    ilan_id parametresi hem veritabanı ID'si (örn: 2) hem de arabam.com ilan numarası olabilir.
+    Küçük sayılar (< 100000) önce veritabanı ID'si olarak aranır."""
     log.info(f"ilan_detay_getir: {ilan_id}")
 
-    sql = f"""
-        SELECT i.ilan_id, i.baslik, i.fiyat, i.yil, i.kilometre,
-               i.motor_hacmi_cc, i.motor_gucu_hp,
-               i.tramer_tl, i.boya_degisen_ozet,
-               m.ad AS marka, ser.ad AS seri, modl.ad AS model,
-               yt.ad AS yakit_tipi, vt.ad AS vites_tipi, kt.ad AS kasa_tipi,
-               r.ad AS renk, il.ad AS il, ilc.ad AS ilce
-        {BASE_JOIN}
-        WHERE i.ilan_id = '{ilan_id}'
-        LIMIT 1
-    """
+    # Küçük sayıysa önce veritabanı id'sine bak, bulamazsa ilan_id'ye bak
+    search_conditions = []
     try:
-        columns, rows = execute_query(sql)
-        if not rows:
-            return json.dumps({"hata": "İlan bulunamadı"}, ensure_ascii=False)
+        numeric_id = int(str(ilan_id).strip())
+        if numeric_id < 100000:
+            search_conditions.append(f"i.id = {numeric_id}")
+        search_conditions.append(f"i.ilan_id = '{ilan_id}'")
+    except ValueError:
+        search_conditions.append(f"i.ilan_id = '{ilan_id}'")
 
-        result = dict(zip(columns, [str(v) if v is not None else None for v in rows[0]]))
-
-        # Boya detayları
+    for condition in search_conditions:
+        sql = f"""
+            SELECT i.id AS db_id, i.ilan_id, i.baslik, i.fiyat, i.yil, i.kilometre,
+                   i.motor_hacmi_cc, i.motor_gucu_hp,
+                   i.tramer_tl, i.boya_degisen_ozet,
+                   m.ad AS marka, ser.ad AS seri, modl.ad AS model,
+                   yt.ad AS yakit_tipi, vt.ad AS vites_tipi, kt.ad AS kasa_tipi,
+                   r.ad AS renk, il.ad AS il, ilc.ad AS ilce
+            {BASE_JOIN}
+            WHERE {condition}
+            LIMIT 1
+        """
         try:
-            bcols, brows = execute_query(f"""
-                SELECT bd.parca_adi, bd.durum
-                FROM boya_detaylari bd
-                JOIN ilanlar i ON bd.ilan_db_id = i.id
-                WHERE i.ilan_id = '{ilan_id}'
-            """)
-            result["boya_detaylari"] = [dict(zip(bcols, row)) for row in brows]
-        except Exception:
-            result["boya_detaylari"] = []
+            columns, rows = execute_query(sql)
+            if rows:
+                result = dict(zip(columns, [str(v) if v is not None else None for v in rows[0]]))
+                found_ilan_id = result.get("ilan_id", ilan_id)
 
-        return json.dumps(result, ensure_ascii=False)
-    except Exception as e:
-        log.error(f"ilan_detay_getir hatası: {e}")
-        return json.dumps({"hata": str(e)}, ensure_ascii=False)
+                # Boya detayları
+                try:
+                    bcols, brows = execute_query(f"""
+                        SELECT bd.parca_adi, bd.durum
+                        FROM boya_detaylari bd
+                        JOIN ilanlar i ON bd.ilan_db_id = i.id
+                        WHERE i.ilan_id = '{found_ilan_id}'
+                    """)
+                    result["boya_detaylari"] = [dict(zip(bcols, row)) for row in brows]
+                except Exception:
+                    result["boya_detaylari"] = []
+
+                return json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            log.error(f"ilan_detay_getir hatası ({condition}): {e}")
+            continue
+
+    return json.dumps({"hata": "İlan bulunamadı"}, ensure_ascii=False)
 
 
 # ─────────────── TOOL 3: fiyat_istatistikleri ───────────────
