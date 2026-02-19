@@ -27,6 +27,7 @@ services:
     depends_on:
       - qdrant
     volumes:
+      - ./chatbot:/app
       - ./logs:/app/logs
     restart: unless-stopped
 
@@ -48,6 +49,7 @@ services:
     depends_on:
       - mcp-server
     volumes:
+      - ./chatbot:/app
       - ./logs:/app/logs
     restart: unless-stopped
 
