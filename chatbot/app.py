@@ -60,6 +60,7 @@ Her soruya uygun aracı seçip çağır, sonuçları doğal ve anlaşılır Tür
 - **`ilan_sayisi`, `renk_dagilimi`, `il_dagilimi`** → İstatistik sorguları.
 - **`marka_seri_listele`** → Marka/seri/model listesi.
 - **`veritabani_ozeti`** → Genel veritabanı bilgisi.
+- **`ilan_gorselleri_analiz_et`** → Kullanıcı bir ilan URL'si verdiğinde, o sayfadaki fotoğrafları Crawl4AI ile çeker ve Gemini Vision ile analiz eder. Boya, aşınma, sigara yanığı, panel aralıkları gibi detayları raporlar.
 
 ## TEKRAR: "Yapamıyorum" deme, her zaman önce `hibrit_arac_ara` ile dene!
 """
@@ -486,12 +487,34 @@ with st.sidebar:
 
     st.markdown('<div class="subtle-divider"></div>', unsafe_allow_html=True)
 
+    # ─────── 📷 Görsel Analiz Bölümü ───────
+    st.markdown("##### 📷 Görsel Analiz")
+    st.caption("İlan URL'sini yapıştırıp fotoğrafları AI ile analiz edin")
+
+    vision_url = st.text_input(
+        "İlan URL'si",
+        placeholder="https://www.arabam.com/ilan/...",
+        key="vision_url_input",
+        label_visibility="collapsed",
+    )
+
+    if st.button("📷 Fotoğrafları Analiz Et", use_container_width=True, key="vision_btn"):
+        if vision_url and vision_url.startswith("http"):
+            st.session_state.vision_url = vision_url
+            st.session_state.vision_trigger = True
+        else:
+            st.warning("Lütfen geçerli bir URL girin.")
+
+    st.markdown('<div class="subtle-divider"></div>', unsafe_allow_html=True)
+
     st.markdown("""
     <div class="tech-bar" style="justify-content: center;">
         <span class="tech-chip">Gemini 2.5</span>
         <span class="tech-chip">Qdrant</span>
         <span class="tech-chip">MySQL</span>
         <span class="tech-chip">FastMCP</span>
+        <span class="tech-chip">Crawl4AI</span>
+        <span class="tech-chip">Vision</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -499,6 +522,8 @@ with st.sidebar:
         st.markdown('<div class="clear-btn">', unsafe_allow_html=True)
         if st.button("🗑️ Sohbeti Temizle", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.pop("vision_trigger", None)
+            st.session_state.pop("vision_url", None)
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -513,6 +538,7 @@ st.markdown("""
 <div class="tech-bar">
     <span class="tech-chip">🛠️ MCP Tools</span>
     <span class="tech-chip">🧠 Gemini Function Calling</span>
+    <span class="tech-chip">📷 Vision AI</span>
     <span class="tech-chip">🤖 AI Destekli</span>
 </div>
 """, unsafe_allow_html=True)
@@ -540,6 +566,10 @@ if not st.session_state.messages:
                 <span class="wf-icon">🔎</span>
                 <span class="wf-label">İlan Detayı</span>
             </div>
+            <div class="welcome-feature">
+                <span class="wf-icon">📷</span>
+                <span class="wf-label">Görsel Analiz</span>
+            </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -553,6 +583,35 @@ for msg in st.session_state.messages:
 default_input = ""
 if "example_input" in st.session_state:
     default_input = st.session_state.pop("example_input")
+
+# ─────────────── VISION ANALIZ TRIGGER ───────────────
+
+if st.session_state.get("vision_trigger"):
+    vision_url = st.session_state.pop("vision_url", "")
+    st.session_state.pop("vision_trigger", None)
+
+    if vision_url:
+        vision_prompt = f"Şu ilanın fotoğraflarını analiz et: {vision_url}"
+        st.session_state.messages.append({"role": "user", "content": vision_prompt})
+        with st.chat_message("user"):
+            st.markdown(f"📷 Görsel analiz: {vision_url}")
+
+        with st.chat_message("assistant"):
+            with st.spinner("📷 Fotoğraflar analiz ediliyor... Bu işlem 15-30 saniye sürebilir."):
+                try:
+                    answer = asyncio.run(
+                        ask_gemini_with_mcp(vision_prompt, st.session_state.messages[:-1])
+                    )
+                    st.markdown(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    log.error(f"Vision hatası: {e}")
+                    error_msg = f"❌ Görsel analiz hatası: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+        st.rerun()
+
+# ─────────────── NORMAL CHAT ───────────────
 
 prompt = st.chat_input("Araçlar hakkında bir şey sor...")
 

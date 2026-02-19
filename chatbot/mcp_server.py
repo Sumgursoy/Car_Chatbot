@@ -18,6 +18,7 @@ load_dotenv()
 
 from db import execute_query, get_db_stats, get_pool
 from vector_db import semantic_search, get_collection_info, ensure_collection
+from vision import analyze_listing
 from logger import get_logger
 
 log = get_logger("mcp")
@@ -637,6 +638,41 @@ def veritabani_ozeti() -> str:
         return json.dumps({"hata": str(e)}, ensure_ascii=False)
 
 
+# ─────────────── TOOL 11: ilan_gorselleri_analiz_et ───────────────
+
+@mcp.tool
+def ilan_gorselleri_analiz_et(url: str) -> str:
+    """Verilen ilan URL'sindeki fotoğrafları Crawl4AI ile çeker ve Gemini Vision ile analiz eder.
+    Aracın gerçek durumunu fotoğraflardan tespit eder: boya, aşınma, sigara yanığı, panel aralıkları.
+    Kullanıcı bir ilan linki verdiğinde bu tool kullanılır.
+    Örnek: 'şu ilanın fotoğraflarını analiz et: https://www.arabam.com/ilan/123456'"""
+    log.info(f"ilan_gorselleri_analiz_et: {url}")
+
+    try:
+        import asyncio
+        result = asyncio.run(analyze_listing(url))
+
+        if "hata" in result and result.get("gorsel_sayisi", 0) == 0:
+            return json.dumps({
+                "hata": result["hata"],
+                "url": url,
+            }, ensure_ascii=False)
+
+        # Screenshot base64'ü çok büyük olduğu için MCP response'dan çıkar
+        response = {
+            "url": url,
+            "sayfa_basligi": result.get("page_title", ""),
+            "analiz_edilen_gorsel_sayisi": result.get("gorsel_sayisi", 0),
+            "gorsel_analiz": result.get("analiz", ""),
+            "gorsel_urlleri": result.get("image_urls", []),
+        }
+        return json.dumps(response, ensure_ascii=False)
+
+    except Exception as e:
+        log.error(f"ilan_gorselleri_analiz_et hatası: {e}")
+        return json.dumps({"hata": str(e)}, ensure_ascii=False)
+
+
 # ─────────────── MAIN ───────────────
 
 if __name__ == "__main__":
@@ -649,6 +685,7 @@ if __name__ == "__main__":
     log.info(f"✅ FastMCP Server çalışıyor: http://0.0.0.0:{PORT}/mcp")
     log.info(f"   Tools: araba_ara, ilan_detay_getir, fiyat_istatistikleri, "
              f"marka_seri_listele, ilan_sayisi, renk_dagilimi, "
-             f"il_dagilimi, hibrit_arac_ara, benzer_arac_bul, veritabani_ozeti")
+             f"il_dagilimi, hibrit_arac_ara, benzer_arac_bul, veritabani_ozeti, "
+             f"ilan_gorselleri_analiz_et")
 
     mcp.run(transport="sse", host="0.0.0.0", port=PORT)
